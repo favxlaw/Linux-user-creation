@@ -21,6 +21,7 @@ Run the script with the input file as an argument:
 
 ```bash
 sudo bash create_users.sh users.txt
+```
 
 Files Created
 /var/log/user_management.log: Log of all actions performed by the script.
