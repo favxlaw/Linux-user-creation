@@ -1,53 +1,35 @@
 #!/bin/bash
 
-# Configuration for log rotation
-LOG_DIR="/var/log"
-LOG_FILE="$LOG_DIR/user_management.log"
-LOG_ROTATE_DAYS=7
-MAX_LOG_FILES=5
-
-# Function to handle log rotation
-log_rotate() {
-    # Rotate log files every $LOG_ROTATE_DAYS days
-    if find "$LOG_FILE" -mtime +$LOG_ROTATE_DAYS > /dev/null 2>&1; then
-        # Rename the current log file with a timestamp
-        timestamp=$(date '+%Y-%m-%d-%H-%M-%S')
-        if mv "$LOG_FILE" "$LOG_DIR/user_management-$timestamp.log"; then
-            # Remove old log files (keep only the latest $MAX_LOG_FILES)
-            if ! ls -1tr $LOG_DIR/user_management-*.log | head -n -$MAX_LOG_FILES | xargs -d '\n' rm -f --; then
-                log "ERROR: Failed to remove old log files"
-            fi
-        else
-            log "ERROR: Failed to rename log file"
-        fi
-    fi
-}
-
-# Set up logging and secure storage
+# Set Up logging and secure storage
+LOG_FILE="/var/log/user_management.log"
 PASSWORD_FILE="/var/secure/user_passwords.txt"
+LOG_ROTATE_DAYS=30
+LOG_MAX_FILES=5
 
-mkdir -p /var/secure || error_exit "Failed to create /var/secure directory"
-touch $LOG_FILE || error_exit "Failed to create log file"
-touch $PASSWORD_FILE || error_exit "Failed to create password file"
-
-chmod 600 $PASSWORD_FILE || error_exit "Failed to set permissions on password file"
+mkdir -p /var/secure
+touch $LOG_FILE
+touch $PASSWORD_FILE
+chmod 600 $PASSWORD_FILE
 
 log() {
-    if ! printf '%s - %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG_FILE"; then
-        echo "ERROR: Failed to write to log file" >&2
-    fi
+    printf '%s - %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG_FILE"
 }
 
 error_exit() {
     log "ERROR: $1"
-    echo "ERROR: $1" >&2
     exit 1
 }
 
-# Automatically call log rotation
-log_rotate
-
 log "Script execution started"
+
+# Log file rotation
+log_rotate() {
+    if [ $(find "$LOG_FILE" -mtime +$LOG_ROTATE_DAYS 2>/dev/null) ]; then
+        timestamp=$(date '+%Y-%m-%d-%H-%M-%S')
+        mv "$LOG_FILE" "/var/log/user_management-$timestamp.log" || error_exit "Failed to rotate log file"
+        find /var/log/ -name "user_management-*.log" -mtime +$LOG_ROTATE_DAYS -exec rm {} \; | tail -n +$LOG_MAX_FILES
+    fi
+}
 
 # Check if the input file is provided, is a regular file, and is readable
 if [ -z "$1" ]; then
@@ -60,104 +42,45 @@ else
     log "Input file $1 is valid, regular, and readable."
 fi
 
-# Function to verify user and groups
-verify_user_and_groups() {
-    local username="$1"
-    local groups="$2"
-    local result=0
-
-    # Verify user exists
-    if ! id -u "$username" > /dev/null 2>&1; then
-        log "Verification failed: User $username does not exist"
-        result=1
-    fi
-
-    # Verify group memberships
-    IFS=',' read -ra group_array <<< "$groups"
-    for group in "${group_array[@]}"; do
-        if ! id -nG "$username" | grep -qw "$group"; then
-            log "Verification failed: User $username is not in group $group"
-            result=1
-        fi
-    done
-
-    return $result
-}
-
-# Function to create and configure a user
-create_and_configure_user() {
+# Function to create user
+create_user() {
     local username="$1"
     local groups="$2"
 
-    # Check if the user already exists
-    if id -u "$username" > /dev/null 2>&1; then
-        log "User $username already exists. Updating groups if necessary."
-    else
-        # Create the user's personal group if it doesn't exist
-        if ! getent group "$username" > /dev/null; then
-            if groupadd "$username"; then
-                log "Created group: $username"
-            else
-                error_exit "Failed to create group: $username"
-            fi
-        fi
-
-        # Create the user if they do not exist
-        if useradd -m -g "$username" -G "$groups" "$username"; then
-            log "Created user: $username with groups: $groups"
-        else
-            error_exit "Failed to create user: $username"
-        fi
-
-        # Generate a random password using pwgen
-        password=$(pwgen -s -c -n 12 -1) || { error_exit "Failed to generate password"; }
-
-        # Set the plain password for the user
-        if echo "$username:$password" | chpasswd; then
-            echo "$username,$password" >> $PASSWORD_FILE || error_exit "Failed to store plain password for user: $username"
-            log "Generated password for user: $username"
-        else
-            error_exit "Failed to set password for user: $username"
-        fi
-
-        # Hash the password using bcrypt
-        hashed_password=$(echo "$password" | openssl passwd -6 -stdin) || { error_exit "Failed to hash password"; }
-
-        # Update the user's password with the hashed password
-        if usermod --password "$hashed_password" "$username"; then
-            log "Stored hashed password for user: $username"
-        else
-            error_exit "Failed to store hashed password for user: $username"
-        fi
+    # Create the user's personal group
+    if ! getent group "$username" > /dev/null; then
+        groupadd "$username" || error_exit "Failed to create group: $username"
+        log "Created group: $username"
     fi
 
-    # Create additional groups if they do not exist and assign user to groups
+    # Create additional groups if they do not exist
     IFS=',' read -ra group_array <<< "$groups"
     for group in "${group_array[@]}"; do
         if ! getent group "$group" > /dev/null; then
-            if groupadd "$group"; then
-                log "Created group: $group"
-            else
-                error_exit "Failed to create group: $group"
-            fi
-        fi
-        if id -nG "$username" | grep -qw "$group"; then
-            log "User $username is already in group $group"
-        else
-            if usermod -aG "$group" "$username"; then
-                log "Added user $username to group $group"
-            else
-                error_exit "Failed to add user $username to group $group"
-            fi
+            groupadd "$group" || error_exit "Failed to create group: $group"
+            log "Created group: $group"
         fi
     done
 
-    # Verify user and group assignments
-    if verify_user_and_groups "$username" "$groups"; then
-        log "Verification passed for user: $username"
+    # Create the user with their personal group and additional groups
+    if ! id -u "$username" > /dev/null 2>&1; then
+        useradd -m -g "$username" -G "$groups" "$username" || error_exit "Failed to create user: $username"
+        log "Created user: $username with groups: $groups"
+
+        # Generate a random password for the user
+        password=$(pwgen -s -c -n 12 -1)
+        echo "$username:$password" | chpasswd || error_exit "Failed to set password for user: $username"
+        echo "$username,$password" >> $PASSWORD_FILE
+        log "Generated password for user: $username"
     else
-        log "Verification failed for user: $username"
+        log "User $username already exists."
     fi
+
+    # Assign the user to the specified groups
+    for group in "${group_array[@]}"; do
+        usermod -aG "$group" "$username" || log "Failed to add user $username to group $group"
+        log "Added user $username to group $group"
+    done
 }
 
 # Read and parse the input file
@@ -165,12 +88,23 @@ while IFS=';' read -r username groups; do
     # Trim whitespace from username and groups
     username=$(echo "$username" | xargs)
     groups=$(echo "$groups" | xargs)
-    
-    log "Parsed username: $username, groups: $groups"
-    
-    # Create user and groups
-    create_and_configure_user "$username" "$groups"
 
-done < "$1" || error_exit "Failed to read input file"
+    # Log the parsed username and groups
+    log "Parsed username: $username, groups: $groups"
+
+    # Split groups by comma and iterate over each group
+    IFS=',' read -ra group_array <<< "$groups"
+    for group in "${group_array[@]}"; do
+        # Trim whitespace from each group name
+        group=$(echo "$group" | xargs)
+        log "Group for $username: $group"
+    done
+
+    create_user "$username" "$groups"
+
+done < "$1"
+
+# Rotate logs at the end of the script execution
+log_rotate
 
 log "Script execution completed"
